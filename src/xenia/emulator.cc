@@ -7,6 +7,7 @@
  ******************************************************************************
  */
 
+#include <cstdlib>
 #include <ranges>
 
 #include "xenia/emulator.h"
@@ -86,6 +87,12 @@ DEFINE_bool(allow_game_relative_writes, false,
             "General");
 
 DECLARE_bool(allow_plugins);
+DECLARE_bool(protect_zero);
+DEFINE_string(unprotect_zero_titles, "545107D1",
+              "Comma-separated title IDs (hex) for which the zero page is made "
+              "readable/writable at launch, like protect_zero = false "
+              "(545107D1 = Saints Row: crashes creating a character).",
+              "Memory");
 
 DEFINE_int32(priority_class, 0,
              "Forces Xenia to use different process priority than default one. "
@@ -1393,8 +1400,9 @@ bool Emulator::ExceptionCallback(Exception* ex) {
     return false;
   }
 
-  // Within range. Pause the emulator and eat the exception.
-  Pause();
+  // Within range. Pause the emulator and eat the exception. The crash dump is
+  // logged before pausing - pausing can block (e.g. in AudioSystem::Pause),
+  // and then the dump would never be written.
 
   // Dump information into the log.
   auto current_thread = kernel::XThread::GetCurrentThread();
@@ -1429,6 +1437,8 @@ bool Emulator::ExceptionCallback(Exception* ex) {
   } else if (ex->code() == Exception::Code::kIllegalInstruction) {
     crash_msg.append("Illegal Instruction\n");
   }
+  crash_msg.append(fmt::format("LR: 0x{:08X} CTR: 0x{:08X}\n",
+                               uint32_t(context->lr), uint32_t(context->ctr)));
   crash_msg.append("Registers:\n");
   for (int i = 0; i < 32; i++) {
     crash_msg.append(fmt::format(" r{:<3} = {:016X}\n", i, context->r[i]));
@@ -1446,6 +1456,8 @@ bool Emulator::ExceptionCallback(Exception* ex) {
                     context->v[i].u32[2], context->v[i].u32[3]));
   }
   XELOGE("{}", crash_msg);
+  xe::FlushLog();
+  Pause();
   std::string crash_dlg = fmt::format(
       "The guest has crashed.\n\n"
       "Xenia has now paused itself.\n\n"
@@ -1664,6 +1676,34 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
           ->PostGameConfigLoad();
     }
     game_config_load_callback_loop_next_index_ = SIZE_MAX;
+
+    // The zero page is protected when memory is initialized, before the
+    // per-game config is known - apply protect_zero = false (from the game
+    // config or the built-in title list) here.
+    {
+      bool unprotect_zero = !cvars::protect_zero;
+      const std::string& list = cvars::unprotect_zero_titles;
+      size_t pos = 0;
+      while (!unprotect_zero && pos < list.size()) {
+        size_t end = list.find(',', pos);
+        if (end == std::string::npos) {
+          end = list.size();
+        }
+        if (std::strtoul(list.substr(pos, end - pos).c_str(), nullptr, 16) ==
+            module->title_id()) {
+          unprotect_zero = true;
+        }
+        pos = end + 1;
+      }
+      if (unprotect_zero) {
+        BaseHeap* zero_heap = memory_->LookupHeap(0);
+        if (zero_heap &&
+            zero_heap->Protect(0, 0x10000,
+                               kMemoryProtectRead | kMemoryProtectWrite)) {
+          XELOGI("Zero page unprotected for title {}", title_id);
+        }
+      }
+    }
 
     const auto db = kernel_state_->module_xdbf(module);
 
