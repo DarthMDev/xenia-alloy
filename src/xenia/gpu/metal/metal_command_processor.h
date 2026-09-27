@@ -14,6 +14,7 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <dispatch/dispatch.h>
 #include <filesystem>
 #include <memory>
@@ -573,6 +574,19 @@ class MetalCommandProcessor : public CommandProcessor {
   std::unordered_set<uint64_t> async_pipeline_pending_;
   std::atomic<uint32_t> async_pipelines_in_flight_{0};
   bool pipeline_creation_pending_ = false;
+  // Background shader translation (metal_async_shader_translation).
+  // Returns true if the translation is usable now, false if it's pending (draw
+  // should be skipped) - failures are reported through *failed.
+  bool EnsureShaderTranslationAsync(MetalShader::MetalTranslation* translation,
+                                    bool* failed);
+  void ShaderTranslationWorkerMain();
+  void ShutdownShaderTranslationWorkers();
+  std::vector<std::thread> shader_translation_threads_;
+  std::mutex shader_translation_mutex_;
+  std::condition_variable shader_translation_cv_;
+  std::deque<MetalShader::MetalTranslation*> shader_translation_queue_;
+  uint32_t shader_translations_in_progress_ = 0;
+  bool shader_translation_shutdown_ = false;
   uint32_t async_pipeline_titles_checked_id_ = UINT32_MAX;
   bool async_pipeline_title_disabled_ = false;
   std::unordered_map<uint64_t, GeometryPipelineState> geometry_pipeline_cache_;

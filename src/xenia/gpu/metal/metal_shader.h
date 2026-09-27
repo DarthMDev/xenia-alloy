@@ -10,6 +10,7 @@
 #ifndef XENIA_GPU_METAL_METAL_SHADER_H_
 #define XENIA_GPU_METAL_METAL_SHADER_H_
 
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -42,8 +43,31 @@ class MetalShader : public DxbcShader {
     // Get the Metal function (shader entry point)
     MTL::Function* metal_function() const { return metal_function_; }
 
+    // Load the metallib from the disk shader cache if present (cheap).
+    bool TryLoadFromDiskCache(MTL::Device* device);
+
+    // Background translation state (metal_async_shader_translation).
+    enum class AsyncState : uint32_t { kNone, kPending, kDone };
+    AsyncState async_state() const {
+      return async_state_.load(std::memory_order_acquire);
+    }
+    // Returns false if already queued or done.
+    bool BeginAsyncTranslation() {
+      AsyncState expected = AsyncState::kNone;
+      return async_state_.compare_exchange_strong(expected,
+                                                  AsyncState::kPending);
+    }
+    void EndAsyncTranslation(bool succeeded) {
+      async_failed_ = !succeeded;
+      async_state_.store(AsyncState::kDone, std::memory_order_release);
+    }
+    bool async_failed() const { return async_failed_; }
+
     // Check if translation succeeded
-    bool is_valid() const { return metal_function_ != nullptr; }
+    bool is_valid() const {
+      return async_state() != AsyncState::kPending &&
+             metal_function_ != nullptr;
+    }
 
     // Get intermediate data for debugging
     const std::vector<uint8_t>& dxil_data() const { return dxil_data_; }
@@ -56,6 +80,8 @@ class MetalShader : public DxbcShader {
     std::vector<uint8_t> dxil_data_;
     std::vector<uint8_t> metallib_data_;
     std::string function_name_;
+    std::atomic<AsyncState> async_state_{AsyncState::kNone};
+    bool async_failed_ = false;
   };
 
   MetalShader(xenos::ShaderType shader_type, uint64_t ucode_data_hash,

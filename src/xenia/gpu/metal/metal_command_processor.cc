@@ -42,6 +42,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/threading.h"
 #include "xenia/base/xxhash.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
@@ -108,6 +109,11 @@ DEFINE_bool(metal_async_pipeline_creation, true,
             "Create new render pipelines asynchronously in the background; "
             "draws using a pipeline that is still compiling are skipped "
             "instead of stalling the frame.",
+            "Metal");
+DEFINE_bool(metal_async_shader_translation, true,
+            "Translate new shaders (DXBC -> DXIL -> Metal) on background "
+            "threads; draws using a shader that is still being translated are "
+            "skipped. Follows metal_async_pipeline_disable_titles.",
             "Metal");
 DEFINE_string(metal_async_pipeline_disable_titles, "4D5307F1",
               "Comma-separated title IDs (hex) for which "
@@ -707,6 +713,7 @@ struct PerfStats {
   uint32_t geometry_skipped = 0;
   uint32_t async_pipelines = 0;
   uint32_t async_skipped_draws = 0;
+  uint32_t async_shaders = 0;
   uint64_t depth_only_tess = 0;
   uint64_t depth_only_plain = 0;
 };
@@ -754,14 +761,14 @@ void PerfOnSwap() {
         "draws/frame={} gpu_wait={:.1f}ms/s ({} waits) "
         "pipelines_slow={} ({:.1f}ms, max {:.1f}ms) shaders={} ({:.1f}ms) "
         "geom_skipped={} depth_only/frame={} (tess {}) "
-        "async_pipelines={} async_skipped_draws={}",
+        "async_pipelines={} async_skipped_draws={} async_shaders={}",
         p.swaps / secs, p.max_frame_ns / 1e6, p.frames_over_40ms,
         p.swaps ? p.draws / p.swaps : 0, p.wait_ns / 1e6 / secs, p.waits,
         p.pipelines_slow, p.pipelines_ns / 1e6, p.pipelines_max_ns / 1e6,
         p.shaders, p.shaders_ns / 1e6, p.geometry_skipped,
         p.swaps ? (p.depth_only_tess + p.depth_only_plain) / p.swaps : 0,
         p.swaps ? p.depth_only_tess / p.swaps : 0, p.async_pipelines,
-        p.async_skipped_draws);
+        p.async_skipped_draws, p.async_shaders);
   }
   auto last_swap = p.last_swap;
   p = PerfStats();
@@ -2057,6 +2064,9 @@ void MetalCommandProcessor::WaitForPendingCompletionHandlers() {
 }
 
 void MetalCommandProcessor::ShutdownContext() {
+#if METAL_SHADER_CONVERTER_AVAILABLE
+  ShutdownShaderTranslationWorkers();
+#endif
   // End any active render encoder before shutdown
   if (current_render_encoder_) {
     current_render_encoder_->endEncoding();
@@ -3390,15 +3400,16 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       return false;
     }
   }
+  bool shader_translation_pending = false;
   if (!use_tessellation_emulation && !vertex_translation->is_valid()) {
-    int64_t translate_start = PerfNowNs();
-    bool translated = vertex_translation->TranslateToMetal(
-        device_, *dxbc_to_dxil_converter_, *metal_shader_converter_);
-    ++g_perf.shaders;
-    g_perf.shaders_ns += PerfNowNs() - translate_start;
-    if (!translated) {
-      XELOGE("Failed to translate vertex shader to Metal");
-      return false;
+    bool translation_failed = false;
+    if (!EnsureShaderTranslationAsync(vertex_translation,
+                                      &translation_failed)) {
+      if (translation_failed) {
+        XELOGE("Failed to translate vertex shader to Metal");
+        return false;
+      }
+      shader_translation_pending = true;
     }
   }
 
@@ -3413,16 +3424,21 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       }
     }
     if (!pixel_translation->is_valid()) {
-      int64_t translate_start = PerfNowNs();
-      bool translated = pixel_translation->TranslateToMetal(
-          device_, *dxbc_to_dxil_converter_, *metal_shader_converter_);
-      ++g_perf.shaders;
-      g_perf.shaders_ns += PerfNowNs() - translate_start;
-      if (!translated) {
-        XELOGE("Failed to translate pixel shader to Metal");
-        return false;
+      bool translation_failed = false;
+      if (!EnsureShaderTranslationAsync(pixel_translation,
+                                        &translation_failed)) {
+        if (translation_failed) {
+          XELOGE("Failed to translate pixel shader to Metal");
+          return false;
+        }
+        shader_translation_pending = true;
       }
     }
+  }
+  if (shader_translation_pending) {
+    // Shaders still being translated in the background - skip this draw.
+    ++g_perf.async_skipped_draws;
+    return true;
   }
 
   TessellationPipelineState* tessellation_pipeline_state = nullptr;
@@ -6658,6 +6674,118 @@ MetalCommandProcessor::GetCurrentRenderPassDescriptor() {
 }
 
 #if METAL_SHADER_CONVERTER_AVAILABLE
+bool MetalCommandProcessor::EnsureShaderTranslationAsync(
+    MetalShader::MetalTranslation* translation, bool* failed) {
+  *failed = false;
+  switch (translation->async_state()) {
+    case MetalShader::MetalTranslation::AsyncState::kPending:
+      return false;
+    case MetalShader::MetalTranslation::AsyncState::kDone:
+      if (translation->is_valid()) {
+        return true;
+      }
+      *failed = true;
+      return false;
+    default:
+      break;
+  }
+  // Cheap path - already translated in a previous run.
+  if (translation->TryLoadFromDiskCache(device_)) {
+    return true;
+  }
+  bool use_async = ::cvars::metal_async_shader_translation;
+  if (use_async) {
+    uint32_t title_id = current_title_id_.load(std::memory_order_relaxed);
+    if (title_id != async_pipeline_titles_checked_id_) {
+      async_pipeline_titles_checked_id_ = title_id;
+      async_pipeline_title_disabled_ = MetalTitleInList(
+          title_id, ::cvars::metal_async_pipeline_disable_titles);
+    }
+    use_async = !async_pipeline_title_disabled_;
+  }
+  if (!use_async) {
+    int64_t translate_start = PerfNowNs();
+    bool translated = translation->TranslateToMetal(
+        device_, *dxbc_to_dxil_converter_, *metal_shader_converter_);
+    ++g_perf.shaders;
+    g_perf.shaders_ns += PerfNowNs() - translate_start;
+    *failed = !translated;
+    return translated;
+  }
+  if (!translation->BeginAsyncTranslation()) {
+    return translation->is_valid();
+  }
+  ++g_perf.async_shaders;
+  {
+    std::lock_guard<std::mutex> lock(shader_translation_mutex_);
+    if (shader_translation_threads_.empty()) {
+      uint32_t thread_count = std::max<uint32_t>(
+          1, std::min<uint32_t>(4, std::thread::hardware_concurrency() / 2));
+      for (uint32_t i = 0; i < thread_count; ++i) {
+        shader_translation_threads_.emplace_back(
+            [this]() { ShaderTranslationWorkerMain(); });
+      }
+      XELOGI("Metal: {} background shader translation threads started",
+             thread_count);
+    }
+    shader_translation_queue_.push_back(translation);
+  }
+  shader_translation_cv_.notify_one();
+  return false;
+}
+
+void MetalCommandProcessor::ShaderTranslationWorkerMain() {
+  xe::threading::set_name("Metal Shader Translation");
+  while (true) {
+    MetalShader::MetalTranslation* translation = nullptr;
+    {
+      std::unique_lock<std::mutex> lock(shader_translation_mutex_);
+      shader_translation_cv_.wait(lock, [this]() {
+        return shader_translation_shutdown_ ||
+               !shader_translation_queue_.empty();
+      });
+      if (shader_translation_shutdown_) {
+        return;
+      }
+      translation = shader_translation_queue_.front();
+      shader_translation_queue_.pop_front();
+      ++shader_translations_in_progress_;
+    }
+    bool translated;
+    {
+      NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+      translated = translation->TranslateToMetal(
+          device_, *dxbc_to_dxil_converter_, *metal_shader_converter_);
+      pool->release();
+    }
+    translation->EndAsyncTranslation(translated);
+    {
+      std::lock_guard<std::mutex> lock(shader_translation_mutex_);
+      --shader_translations_in_progress_;
+    }
+    shader_translation_cv_.notify_all();
+  }
+}
+
+void MetalCommandProcessor::ShutdownShaderTranslationWorkers() {
+  {
+    std::unique_lock<std::mutex> lock(shader_translation_mutex_);
+    // Let in-progress translations finish, drop queued ones.
+    shader_translation_queue_.clear();
+    shader_translation_cv_.wait(
+        lock, [this]() { return shader_translations_in_progress_ == 0; });
+    shader_translation_shutdown_ = true;
+  }
+  shader_translation_cv_.notify_all();
+  for (std::thread& thread : shader_translation_threads_) {
+    if (thread.joinable()) {
+      thread.join();
+    }
+  }
+  shader_translation_threads_.clear();
+  shader_translation_shutdown_ = false;
+}
+
 MTL::RenderPipelineState* MetalCommandProcessor::GetOrCreatePipelineState(
     MetalShader::MetalTranslation* vertex_translation,
     MetalShader::MetalTranslation* pixel_translation,

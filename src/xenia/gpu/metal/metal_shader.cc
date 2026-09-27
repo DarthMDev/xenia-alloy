@@ -52,25 +52,13 @@ MetalShader::MetalTranslation::~MetalTranslation() {
   }
 }
 
-bool MetalShader::MetalTranslation::TranslateToMetal(
-    MTL::Device* device, DxbcToDxilConverter& dxbc_converter,
-    MetalShaderConverter& metal_converter) {
-  if (!device) {
-    XELOGE("MetalShader: No Metal device provided");
-    return false;
+bool MetalShader::MetalTranslation::TryLoadFromDiskCache(MTL::Device* device) {
+  if (!device || metal_function_) {
+    return metal_function_ != nullptr;
   }
-
-  // Get the translated DXBC bytecode from the base class
-  const std::vector<uint8_t>& dxbc_data = translated_binary();
-  if (dxbc_data.empty()) {
-    XELOGE("MetalShader: No translated DXBC data available");
-    return false;
-  }
-
   const uint64_t shader_cache_key =
       MetalShaderCache::GetCacheKey(shader().ucode_data_hash(), modification(),
                                     static_cast<uint32_t>(shader().type()));
-
   if (cvars::metal_shader_disk_cache && g_metal_shader_cache &&
       g_metal_shader_cache->IsInitialized()) {
     MetalShaderCache::CachedMetallib cached;
@@ -94,6 +82,31 @@ bool MetalShader::MetalTranslation::TranslateToMetal(
         metal_library_ = nullptr;
       }
     }
+  }
+  return false;
+}
+
+bool MetalShader::MetalTranslation::TranslateToMetal(
+    MTL::Device* device, DxbcToDxilConverter& dxbc_converter,
+    MetalShaderConverter& metal_converter) {
+  if (!device) {
+    XELOGE("MetalShader: No Metal device provided");
+    return false;
+  }
+
+  // Get the translated DXBC bytecode from the base class
+  const std::vector<uint8_t>& dxbc_data = translated_binary();
+  if (dxbc_data.empty()) {
+    XELOGE("MetalShader: No translated DXBC data available");
+    return false;
+  }
+
+  const uint64_t shader_cache_key =
+      MetalShaderCache::GetCacheKey(shader().ucode_data_hash(), modification(),
+                                    static_cast<uint32_t>(shader().type()));
+
+  if (TryLoadFromDiskCache(device)) {
+    return true;
   }
   auto dump_msc_failure = [&](const char* reason) {
     if (cvars::dump_shaders.empty()) {
