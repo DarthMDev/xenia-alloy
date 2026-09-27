@@ -9,9 +9,11 @@
 
 #include "src/xenia/kernel/xsocket.h"
 
+#include <cerrno>
 #include <cstring>
 
 #include "xenia/base/logging.h"
+#include "xenia/base/memory.h"
 #include "xenia/base/platform.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/xam/xam_module.h"
@@ -27,6 +29,7 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
+#include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -167,20 +170,46 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
   }
   return X_STATUS_SUCCESS;
 #else
-  int native_cmd = cmd;
-
-  assert_false(!supported_controls.contains(cmd));
-
-  if (supported_controls.contains(cmd)) {
-    native_cmd = supported_controls.at(cmd);
+  // Guest arguments are big-endian 32-bit values. Handle the common controls
+  // explicitly - passing the Windows command code through an int to ioctl()
+  // sign-extends it on 64-bit hosts (0x8004667E -> 0xFFFFFFFF8004667E), which
+  // macOS rejects, leaving sockets blocking (Saints Row hangs in recvfrom).
+  int fd = static_cast<int>(native_handle_);
+  switch (cmd) {
+    case 0x8004667E: {  // FIONBIO
+      uint32_t enable = arg_ptr ? xe::load_and_swap<uint32_t>(arg_ptr) : 0;
+      int flags = fcntl(fd, F_GETFL, 0);
+      if (flags < 0) {
+        return X_STATUS_UNSUCCESSFUL;
+      }
+      flags = enable ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
+      if (fcntl(fd, F_SETFL, flags) < 0) {
+        return X_STATUS_UNSUCCESSFUL;
+      }
+      return X_STATUS_SUCCESS;
+    }
+    case 0x4004667F: {  // FIONREAD
+      int available = 0;
+      if (ioctl(fd, FIONREAD, &available) < 0) {
+        return X_STATUS_UNSUCCESSFUL;
+      }
+      if (arg_ptr) {
+        xe::store_and_swap<uint32_t>(arg_ptr, uint32_t(available));
+      }
+      return X_STATUS_SUCCESS;
+    }
+    default:
+      break;
   }
 
-  int ret = ioctl(native_handle_, native_cmd, arg_ptr);
-
+  unsigned long native_cmd = cmd;
+  if (supported_controls.contains(cmd)) {
+    native_cmd = static_cast<unsigned long>(supported_controls.at(cmd));
+  }
+  int ret = ioctl(fd, native_cmd, arg_ptr);
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
   }
-
   return X_STATUS_SUCCESS;
 #endif
 }
@@ -366,12 +395,34 @@ uint32_t XSocket::GetLastWSAError() const {
   const uint32_t error_no = errno;
   // For now only use switch case. If this will expand to more than 3-4 entries
   // then it will be reasonable to create some form of map.
+#ifndef XE_PLATFORM_WIN32
+  // Map POSIX errno values (which differ between Linux and macOS) to WSA.
+  if (error_no == EAGAIN || error_no == EWOULDBLOCK ||
+      error_no == EINPROGRESS) {
+    return 10035;  // WSAEWOULDBLOCK
+  }
   switch (error_no) {
-    case 11:
-      return 10035;
+    case EBADF:
+    case ENOTSOCK:
+      return 10038;  // WSAENOTSOCK
+    case EMSGSIZE:
+      return 10040;  // WSAEMSGSIZE
+    case EADDRINUSE:
+      return 10048;  // WSAEADDRINUSE
+    case ECONNRESET:
+      return 10054;  // WSAECONNRESET
+    case ENOTCONN:
+      return 10057;  // WSAENOTCONN
+    case ETIMEDOUT:
+      return 10060;  // WSAETIMEDOUT
+    case ECONNREFUSED:
+      return 10061;  // WSAECONNREFUSED
     default:
       return error_no;
   }
+#else
+  return error_no;
+#endif
 }
 
 }  // namespace kernel
