@@ -200,23 +200,6 @@ bool PPCTranslator::Translate(GuestFunction* function,
     debug_info_flags |= DebugInfoFlags::kDebugInfoAllDisasm;
   }
   bool log_disassembly = false;
-  if (!cvars::debug_disassemble_guest_functions.empty()) {
-    const std::string& list = cvars::debug_disassemble_guest_functions;
-    size_t pos = 0;
-    while (pos < list.size()) {
-      size_t end = list.find(',', pos);
-      if (end == std::string::npos) {
-        end = list.size();
-      }
-      if (std::strtoul(list.substr(pos, end - pos).c_str(), nullptr, 16) ==
-          function->address()) {
-        log_disassembly = true;
-        debug_info_flags |= DebugInfoFlags::kDebugInfoDisasmSource;
-        break;
-      }
-      pos = end + 1;
-    }
-  }
   if (cvars::trace_functions) {
     debug_info_flags |= DebugInfoFlags::kDebugInfoTraceFunctions;
   }
@@ -237,6 +220,30 @@ bool PPCTranslator::Translate(GuestFunction* function,
   // Scan the function to find its extents and gather debug data.
   if (!scanner_->Scan(function, debug_info.get())) {
     return false;
+  }
+
+  // Debug: log the disassembly of functions containing any listed address.
+  if (!cvars::debug_disassemble_guest_functions.empty()) {
+    const std::string& list = cvars::debug_disassemble_guest_functions;
+    size_t pos = 0;
+    while (pos < list.size()) {
+      size_t end = list.find(',', pos);
+      if (end == std::string::npos) {
+        end = list.size();
+      }
+      uint32_t address = uint32_t(
+          std::strtoul(list.substr(pos, end - pos).c_str(), nullptr, 16));
+      if (address >= function->address() &&
+          address <= function->end_address()) {
+        log_disassembly = true;
+        debug_info_flags |= DebugInfoFlags::kDebugInfoDisasmSource;
+        if (!debug_info) {
+          debug_info.reset(new FunctionDebugInfo());
+        }
+        break;
+      }
+      pos = end + 1;
+    }
   }
 
   // Setup trace data, if needed.

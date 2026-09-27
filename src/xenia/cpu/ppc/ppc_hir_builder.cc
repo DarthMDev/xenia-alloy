@@ -47,6 +47,10 @@ DEFINE_string(debug_trace_guest_watch, "",
               "Comma-separated hex guest addresses whose 32-bit values are "
               "added to each debug_trace_guest_functions log line.",
               "CPU");
+DEFINE_bool(debug_trace_guest_watch_changes, false,
+            "Log debug_trace_guest_functions entries only when the first "
+            "debug_trace_guest_watch value changed (no rate limit).",
+            "CPU");
 
 namespace xe {
 namespace cpu {
@@ -75,7 +79,20 @@ void TraceGuestFunctionEntry(PPCContext* ctx, void* arg0, void* arg1) {
   auto address = uint32_t(reinterpret_cast<uintptr_t>(arg1));
   static std::atomic<uint32_t> count{0};
   uint32_t n = count.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (n > 200 && (n % 5000) != 0) {
+  if (cvars::debug_trace_guest_watch_changes) {
+    static std::atomic<uint32_t> last_watch{0xDEADBEEFu};
+    const std::string& list = cvars::debug_trace_guest_watch;
+    uint32_t first = uint32_t(std::strtoul(
+        list.substr(0, list.find(',')).c_str(), nullptr, 16));
+    if (first < 0x30000000u || first >= 0xFFFF0000u) {
+      return;
+    }
+    uint32_t value = xe::load_and_swap<uint32_t>(
+        memory->TranslateVirtual<const uint8_t*>(first));
+    if (last_watch.exchange(value, std::memory_order_relaxed) == value) {
+      return;
+    }
+  } else if (n > 200 && (n % 5000) != 0) {
     return;
   }
   std::string text = fmt::format(
