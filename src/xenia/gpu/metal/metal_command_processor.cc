@@ -104,6 +104,12 @@ DEFINE_int32(metal_sync_gpu_writes_skip_after_frames, 90,
              "written in every frame for more than this many consecutive frames "
              "are treated as GPU-only and don't trigger waits. 0 = always wait.",
              "GPU");
+DEFINE_string(metal_depth_float24_convert_titles, "545407EE",
+              "Comma-separated title IDs (hex) for which "
+              "depth_float24_convert_in_pixel_shader is enabled automatically "
+              "(545407EE = The Darkness: shadow acne crosshatch on lit "
+              "surfaces).",
+              "Metal");
 DEFINE_string(metal_sync_all_gpu_work_for_guest_titles, "545407EE",
               "Comma-separated title IDs (hex) for which every guest-visible "
               "GPU sync point (fences, interrupts) waits for all submitted GPU "
@@ -2253,10 +2259,19 @@ void MetalCommandProcessor::InitializeShaderStorage(
 }
 #endif  // METAL_SHADER_CONVERTER_AVAILABLE
 
+static bool MetalTitleInList(uint32_t title_id, const std::string& list);
+
 #if METAL_SHADER_CONVERTER_AVAILABLE
 bool MetalCommandProcessor::InitializeShaderStorageInternal(
     const std::filesystem::path& cache_root, uint32_t title_id, bool blocking) {
   current_title_id_.store(title_id, std::memory_order_relaxed);
+  if (!::cvars::depth_float24_convert_in_pixel_shader &&
+      MetalTitleInList(title_id, ::cvars::metal_depth_float24_convert_titles)) {
+    ::cvars::depth_float24_convert_in_pixel_shader = true;
+    XELOGI("Metal: depth_float24_convert_in_pixel_shader enabled for title "
+           "{:08X}",
+           title_id);
+  }
   ShutdownShaderStorage();
 
   if (!device_) {
