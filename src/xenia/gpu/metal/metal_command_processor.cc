@@ -127,7 +127,15 @@ DEFINE_string(metal_depth_float24_convert_titles, "545407EE",
               "(545407EE = The Darkness: shadow acne crosshatch on lit "
               "surfaces).",
               "Metal");
-DEFINE_string(metal_sync_all_gpu_work_for_guest_titles, "545407EE",
+DEFINE_string(metal_shared_memory_copy_titles, "545407EE",
+              "Comma-separated title IDs (hex) for which the zero-copy shared "
+              "memory is replaced with a copy updated on demand when the title "
+              "starts - for titles reusing vertex/constant memory right after "
+              "a fence (545407EE = The Darkness: garbage band at the top of "
+              "the frame). GPU writes (resolves) then aren't visible to the "
+              "guest CPU.",
+              "Metal");
+DEFINE_string(metal_sync_all_gpu_work_for_guest_titles, "",
               "Comma-separated title IDs (hex) for which every guest-visible "
               "GPU sync point (fences, interrupts) waits for all submitted GPU "
               "work. Needed with zero-copy shared memory when a title reuses "
@@ -2304,6 +2312,14 @@ static bool MetalTitleInList(uint32_t title_id, const std::string& list);
 bool MetalCommandProcessor::InitializeShaderStorageInternal(
     const std::filesystem::path& cache_root, uint32_t title_id, bool blocking) {
   current_title_id_.store(title_id, std::memory_order_relaxed);
+  if (shared_memory_ && shared_memory_->IsZeroCopy() &&
+      MetalTitleInList(title_id, ::cvars::metal_shared_memory_copy_titles)) {
+    // Nothing may still use the zero-copy buffer.
+    if (EnsureCommandBuffer()) {
+      CommitAndWaitCurrentCommandBuffer();
+    }
+    shared_memory_->SwitchToCopyMode();
+  }
   if (!::cvars::depth_float24_convert_in_pixel_shader &&
       MetalTitleInList(title_id, ::cvars::metal_depth_float24_convert_titles)) {
     ::cvars::depth_float24_convert_in_pixel_shader = true;

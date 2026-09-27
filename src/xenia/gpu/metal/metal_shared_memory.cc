@@ -9,6 +9,8 @@
 
 #include "xenia/gpu/metal/metal_shared_memory.h"
 
+#include <cstring>
+
 #include "xenia/base/logging.h"
 #include "xenia/base/memory.h"
 #include "xenia/gpu/gpu_flags.h"
@@ -87,6 +89,33 @@ bool MetalSharedMemory::Initialize() {
 }
 
 void MetalSharedMemory::ClearCache() { SharedMemory::ClearCache(); }
+
+bool MetalSharedMemory::SwitchToCopyMode() {
+  if (!use_zero_copy_) {
+    return true;
+  }
+  const ui::metal::MetalProvider& provider =
+      command_processor_.GetMetalProvider();
+  MTL::Device* device = provider.GetDevice();
+  void* xbox_ram = memory().TranslatePhysical(0);
+  if (!device || !xbox_ram) {
+    return false;
+  }
+  MTL::Buffer* copy_buffer =
+      device->newBuffer(kBufferSize, MTL::ResourceStorageModeShared);
+  if (!copy_buffer) {
+    XELOGW("Metal shared memory: failed to create the copy-mode buffer");
+    return false;
+  }
+  // Pages tracked as valid match guest memory now, so the validity state stays
+  // correct after a full copy.
+  std::memcpy(copy_buffer->contents(), xbox_ram, kBufferSize);
+  buffer_->release();
+  buffer_ = copy_buffer;
+  use_zero_copy_ = false;
+  XELOGI("Metal shared memory: switched to copy mode");
+  return true;
+}
 
 bool MetalSharedMemory::UploadRanges(
     const std::pair<uint32_t, uint32_t>* upload_page_ranges,

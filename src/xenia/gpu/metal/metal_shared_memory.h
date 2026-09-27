@@ -30,6 +30,12 @@ class MetalSharedMemory : public SharedMemory {
   void ClearCache() override;
 
   MTL::Buffer* GetBuffer() const { return buffer_; }
+  bool IsZeroCopy() const { return use_zero_copy_; }
+  // Replace the zero-copy (bytes-no-copy) buffer with a separate GPU buffer
+  // holding a copy of guest memory, updated through UploadRanges - the GPU
+  // then no longer sees guest CPU writes made after commands were recorded.
+  // No GPU work may be in flight.
+  bool SwitchToCopyMode();
   const uint8_t* GetXboxRamBase() const {
     return static_cast<const uint8_t*>(memory().TranslatePhysical(0));
   }

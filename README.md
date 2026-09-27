@@ -33,7 +33,7 @@ Tested on an Apple M4 with macOS 27. Anything not listed here is untested — re
 | Forza Horizon | 4D5309C9 | **Playable** | Races complete, ~20–29 FPS. Short stutters while new shaders compile. A crash after returning to the menu several times is under investigation. |
 | Project Gotham Racing 4 | 4D5307F9 | **Playable** | Runs without visible issues, ~28–30 FPS over a 20+ minute session. Tested with the World disc. |
 | Saints Row | 545107D1 | **In-game** | Free roam works, ~28 FPS on average with occasional drops. Minor graphical glitches; audio can lag behind in cutscenes after a hitch. The zero page is unprotected automatically for this title (fixes the character creation crash). Tested with the World disc. |
-| The Darkness | 545407EE | **In-game** | Menus and gameplay work. The screen band, flickering polygons and the crosshatch (shadow acne) pattern are fixed. ~22–24 FPS (full GPU sync and float24 depth conversion are enabled for this title); scenes can look slightly overexposed. Tested with the USA/Europe disc, v1.0. |
+| The Darkness | 545407EE | **In-game** | Menus and gameplay work. The screen band, flickering polygons and the crosshatch (shadow acne) pattern are fixed. ~28 FPS (the zero-copy shared memory is replaced with an on-demand copy for this title, float24 depth conversion is enabled). Remaining: a small flickering rectangle in the bottom-right corner, scenes can look slightly overexposed. Tested with the USA/Europe disc, v1.0. |
 
 ## What is in this build
 
