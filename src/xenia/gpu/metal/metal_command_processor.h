@@ -560,6 +560,21 @@ class MetalCommandProcessor : public CommandProcessor {
 
   // MSC pipeline caches (keyed by shader combination)
   std::unordered_map<uint64_t, MTL::RenderPipelineState*> pipeline_cache_;
+  // Asynchronous pipeline creation (metal_async_pipeline_creation): pipelines
+  // compiled by Metal in the background, draws using them are skipped until
+  // they're ready.
+  struct AsyncPipelineResult {
+    MTL::RenderPipelineState* pipeline = nullptr;
+    PipelineDiskCacheEntry disk_entry;
+    bool record_disk_entry = false;
+  };
+  std::mutex async_pipeline_mutex_;
+  std::unordered_map<uint64_t, AsyncPipelineResult> async_pipeline_ready_;
+  std::unordered_set<uint64_t> async_pipeline_pending_;
+  std::atomic<uint32_t> async_pipelines_in_flight_{0};
+  bool pipeline_creation_pending_ = false;
+  uint32_t async_pipeline_titles_checked_id_ = UINT32_MAX;
+  bool async_pipeline_title_disabled_ = false;
   std::unordered_map<uint64_t, GeometryPipelineState> geometry_pipeline_cache_;
   std::unordered_map<MetalShader::MetalTranslation*, GeometryVertexStageState>
       geometry_vertex_stage_cache_;

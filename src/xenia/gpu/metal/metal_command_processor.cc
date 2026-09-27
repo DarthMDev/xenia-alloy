@@ -104,6 +104,17 @@ DEFINE_int32(metal_sync_gpu_writes_skip_after_frames, 90,
              "written in every frame for more than this many consecutive frames "
              "are treated as GPU-only and don't trigger waits. 0 = always wait.",
              "GPU");
+DEFINE_bool(metal_async_pipeline_creation, true,
+            "Create new render pipelines asynchronously in the background; "
+            "draws using a pipeline that is still compiling are skipped "
+            "instead of stalling the frame.",
+            "Metal");
+DEFINE_string(metal_async_pipeline_disable_titles, "4D5307F1",
+              "Comma-separated title IDs (hex) for which "
+              "metal_async_pipeline_creation is disabled (4D5307F1 = Fable II: "
+              "one-time render-to-texture of hero/dog/clothing textures must "
+              "not skip draws).",
+              "Metal");
 DEFINE_string(metal_depth_float24_convert_titles, "545407EE",
               "Comma-separated title IDs (hex) for which "
               "depth_float24_convert_in_pixel_shader is enabled automatically "
@@ -694,6 +705,8 @@ struct PerfStats {
   uint32_t shaders = 0;
   int64_t shaders_ns = 0;
   uint32_t geometry_skipped = 0;
+  uint32_t async_pipelines = 0;
+  uint32_t async_skipped_draws = 0;
   uint64_t depth_only_tess = 0;
   uint64_t depth_only_plain = 0;
 };
@@ -740,13 +753,15 @@ void PerfOnSwap() {
         "Perf: fps={:.1f} frame_max={:.1f}ms slow_frames(>40ms)={} "
         "draws/frame={} gpu_wait={:.1f}ms/s ({} waits) "
         "pipelines_slow={} ({:.1f}ms, max {:.1f}ms) shaders={} ({:.1f}ms) "
-        "geom_skipped={} depth_only/frame={} (tess {})",
+        "geom_skipped={} depth_only/frame={} (tess {}) "
+        "async_pipelines={} async_skipped_draws={}",
         p.swaps / secs, p.max_frame_ns / 1e6, p.frames_over_40ms,
         p.swaps ? p.draws / p.swaps : 0, p.wait_ns / 1e6 / secs, p.waits,
         p.pipelines_slow, p.pipelines_ns / 1e6, p.pipelines_max_ns / 1e6,
         p.shaders, p.shaders_ns / 1e6, p.geometry_skipped,
         p.swaps ? (p.depth_only_tess + p.depth_only_plain) / p.swaps : 0,
-        p.swaps ? p.depth_only_tess / p.swaps : 0);
+        p.swaps ? p.depth_only_tess / p.swaps : 0, p.async_pipelines,
+        p.async_skipped_draws);
   }
   auto last_swap = p.last_swap;
   p = PerfStats();
@@ -815,6 +830,20 @@ MetalCommandProcessor::~MetalCommandProcessor() {
   }
 
 #if METAL_SHADER_CONVERTER_AVAILABLE
+  // Wait for background pipeline compilations (their handlers reference this).
+  while (async_pipelines_in_flight_.load(std::memory_order_acquire)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  {
+    std::lock_guard<std::mutex> lock(async_pipeline_mutex_);
+    for (auto& pair : async_pipeline_ready_) {
+      if (pair.second.pipeline) {
+        pair.second.pipeline->release();
+      }
+    }
+    async_pipeline_ready_.clear();
+    async_pipeline_pending_.clear();
+  }
   // Release MSC pipeline caches
   for (auto& pair : pipeline_cache_) {
     if (pair.second) {
@@ -3429,8 +3458,15 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     }
     pipeline = geometry_pipeline_state->pipeline;
   } else {
+    pipeline_creation_pending_ = false;
     pipeline =
         GetOrCreatePipelineState(vertex_translation, pixel_translation, regs);
+    if (!pipeline && pipeline_creation_pending_) {
+      // Still compiling in the background - skip this draw.
+      pipeline_creation_pending_ = false;
+      ++g_perf.async_skipped_draws;
+      return true;
+    }
   }
 
   if (!pipeline) {
@@ -6781,6 +6817,54 @@ MTL::RenderPipelineState* MetalCommandProcessor::GetOrCreatePipelineState(
   if (it != pipeline_cache_.end()) {
     return it->second;
   }
+
+  bool use_async_pipeline = ::cvars::metal_async_pipeline_creation;
+  if (use_async_pipeline) {
+    uint32_t title_id = current_title_id_.load(std::memory_order_relaxed);
+    if (title_id != async_pipeline_titles_checked_id_) {
+      async_pipeline_titles_checked_id_ = title_id;
+      async_pipeline_title_disabled_ = MetalTitleInList(
+          title_id, ::cvars::metal_async_pipeline_disable_titles);
+      if (async_pipeline_title_disabled_) {
+        XELOGI("Metal: async pipeline creation disabled for title {:08X}",
+               title_id);
+      }
+    }
+    use_async_pipeline = !async_pipeline_title_disabled_;
+  }
+  {
+    // Pick up a pipeline finished in the background (also when async creation
+    // was switched off meanwhile).
+    AsyncPipelineResult ready;
+    bool have_ready = false;
+    bool pending = false;
+    {
+      std::lock_guard<std::mutex> lock(async_pipeline_mutex_);
+      auto ready_it = async_pipeline_ready_.find(key);
+      if (ready_it != async_pipeline_ready_.end()) {
+        ready = std::move(ready_it->second);
+        async_pipeline_ready_.erase(ready_it);
+        have_ready = true;
+      } else {
+        pending = async_pipeline_pending_.count(key) != 0;
+      }
+    }
+    if (have_ready) {
+      if (ready.pipeline) {
+        pipeline_cache_[key] = ready.pipeline;
+        if (ready.record_disk_entry) {
+          AppendPipelineDiskCacheEntry(ready.disk_entry);
+        }
+        return ready.pipeline;
+      }
+      // Background creation failed - retry synchronously below to log why.
+      use_async_pipeline = false;
+    } else if (pending) {
+      pipeline_creation_pending_ = true;
+      return nullptr;
+    }
+  }
+
   struct PipelineCreationTimer {
     int64_t start = PerfNowNs();
     ~PipelineCreationTimer() { PerfAddPipelineTime(PerfNowNs() - start); }
@@ -6990,6 +7074,79 @@ MTL::RenderPipelineState* MetalCommandProcessor::GetOrCreatePipelineState(
 
     desc->setVertexDescriptor(vertex_desc);
     vertex_desc->release();
+  }
+
+  if (use_async_pipeline) {
+    // Use the binary archive: if the pipeline is already in it (from previous
+    // runs or the prewarm), creating it is a cheap lookup - do it right away
+    // and don't skip the draw.
+    bool archive_attached = false;
+    {
+      std::lock_guard<std::mutex> lock(pipeline_binary_archive_mutex_);
+      if (pipeline_binary_archive_ && !g_archive_save_in_progress.load()) {
+        desc->setBinaryArchives(NS::Array::array(pipeline_binary_archive_));
+        archive_attached = true;
+      }
+    }
+    if (archive_attached) {
+      NS::Error* archive_error = nullptr;
+      MTL::RenderPipelineState* archived_pipeline =
+          device_->newRenderPipelineState(
+              desc, MTL::PipelineOptionFailOnBinaryArchiveMiss, nullptr,
+              &archive_error);
+      if (archived_pipeline) {
+        desc->release();
+        pipeline_cache_[key] = archived_pipeline;
+        if (record_disk_entry) {
+          AppendPipelineDiskCacheEntry(disk_entry);
+        }
+        return archived_pipeline;
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(async_pipeline_mutex_);
+      async_pipeline_pending_.insert(key);
+    }
+    async_pipelines_in_flight_.fetch_add(1, std::memory_order_acq_rel);
+    ++g_perf.async_pipelines;
+    // The descriptor is owned by the handler from here on.
+    device_->newRenderPipelineState(
+        desc, [this, key, desc, disk_entry, record_disk_entry](
+                  MTL::RenderPipelineState* async_pipeline,
+                  NS::Error* async_error) {
+          if (async_pipeline) {
+            async_pipeline->retain();
+            // Add to the binary archive off the draw thread - this compiles
+            // the pipeline once more.
+            std::lock_guard<std::mutex> archive_lock(
+                pipeline_binary_archive_mutex_);
+            if (pipeline_binary_archive_ &&
+                !g_archive_save_in_progress.load()) {
+              NS::Error* archive_error = nullptr;
+              if (pipeline_binary_archive_->addRenderPipelineFunctions(
+                      desc, &archive_error)) {
+                pipeline_binary_archive_dirty_ = true;
+              }
+            }
+          } else {
+            XELOGW("Metal: async pipeline creation failed: {}",
+                   async_error && async_error->localizedDescription()
+                       ? async_error->localizedDescription()->utf8String()
+                       : "unknown error");
+          }
+          desc->release();
+          {
+            std::lock_guard<std::mutex> lock(async_pipeline_mutex_);
+            async_pipeline_pending_.erase(key);
+            AsyncPipelineResult& result = async_pipeline_ready_[key];
+            result.pipeline = async_pipeline;
+            result.disk_entry = disk_entry;
+            result.record_disk_entry = record_disk_entry;
+          }
+          async_pipelines_in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+        });
+    pipeline_creation_pending_ = true;
+    return nullptr;
   }
 
   {
