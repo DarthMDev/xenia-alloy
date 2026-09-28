@@ -97,6 +97,11 @@ endif()
 if(APPLE)
   target_link_libraries(xenia-app PRIVATE xenia-gpu-metal xenia-ui-metal
     "-framework Cocoa" "-framework Metal" "-framework QuartzCore")
+  # App icon (assets/icon/icon.icns, generated from the PNGs next to it).
+  set(XE_APP_ICON "${PROJECT_SOURCE_DIR}/assets/icon/icon.icns")
+  target_sources(xenia-app PRIVATE "${XE_APP_ICON}")
+  set_source_files_properties("${XE_APP_ICON}" PROPERTIES
+    MACOSX_PACKAGE_LOCATION "Resources")
   set_target_properties(xenia-app PROPERTIES
     MACOSX_BUNDLE_GUI_IDENTIFIER "jp.xenia.canary.mac"
     MACOSX_BUNDLE_BUNDLE_NAME "Xenia Canary"

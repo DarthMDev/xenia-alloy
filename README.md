@@ -1,5 +1,5 @@
 <p align="center">
-    <img height="192px" src="https://raw.githubusercontent.com/xenia-canary/xenia/master/assets/icon/256.png" />
+    <img height="192px" src="assets/icon/256.png" />
 </p>
 
 <h1 align="center">Xenia Canary for macOS — native Metal build</h1>
