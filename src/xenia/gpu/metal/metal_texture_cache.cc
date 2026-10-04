@@ -21,6 +21,7 @@
 #include <limits>
 #include <mutex>
 #include <unordered_map>
+#include <cstdlib>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -102,6 +103,19 @@ DEFINE_bool(metal_force_bc_decompress, false,
 DEFINE_bool(metal_force_linear_filter, false,
             "Force linear min/mag/mip filtering on all samplers (debug).",
             "GPU");
+DEFINE_bool(metal_debug_log_texture_formats, false,
+            "Debug: log every distinct combination of texture format, signs, "
+            "swizzle and fetch kind bound for drawing (once each).",
+            "GPU");
+DEFINE_string(metal_debug_null_texture_formats, "",
+              "Debug: comma-separated guest texture format numbers (as in the "
+              "TexFmt log) whose textures are replaced with a null (black) "
+              "texture when bound for drawing.",
+              "GPU");
+DEFINE_double(metal_debug_max_lod, -1.0,
+              "Debug: if not negative, clamps the maximum mip level sampled "
+              "from all textures to this value (0 = base level only).",
+              "GPU");
 DEFINE_string(metal_force_linear_filter_titles, "4D5307F1",
               "Comma-separated title IDs (hex) for which "
               "metal_force_linear_filter is enabled automatically (4D5307F1 = "
@@ -731,7 +745,11 @@ MTL::PixelFormat MetalTextureCache::GetPixelFormatForKey(TextureKey key) const {
     case xenos::TextureFormat::k_8_8:
       return MTL::PixelFormatRG8Unorm;
     case xenos::TextureFormat::k_1_5_5_5:
-      return MTL::PixelFormatA1BGR5Unorm;
+      // The load shader produces B5G5R5A1 like DXGI (blue in bits 0-4, alpha
+      // in bit 15). Metal names packed formats from the least significant bit,
+      // so that's BGR5A1 - A1BGR5 has alpha in bit 0 and shifts every color
+      // channel by one bit.
+      return MTL::PixelFormatBGR5A1Unorm;
     case xenos::TextureFormat::k_5_6_5:
     case xenos::TextureFormat::k_6_5_5:
       return MTL::PixelFormatB5G6R5Unorm;
@@ -2090,7 +2108,11 @@ MTL::PixelFormat MetalTextureCache::ConvertXenosFormat(
       // to RGBA for Metal.
       return MTL::PixelFormatRGBA8Unorm;
     case xenos::TextureFormat::k_1_5_5_5:
-      return MTL::PixelFormatA1BGR5Unorm;
+      // The load shader produces B5G5R5A1 like DXGI (blue in bits 0-4, alpha
+      // in bit 15). Metal names packed formats from the least significant bit,
+      // so that's BGR5A1 - A1BGR5 has alpha in bit 0 and shifts every color
+      // channel by one bit.
+      return MTL::PixelFormatBGR5A1Unorm;
     case xenos::TextureFormat::k_5_6_5:
       return MTL::PixelFormatB5G6R5Unorm;
     case xenos::TextureFormat::k_8:
@@ -2535,6 +2557,61 @@ MTL::Texture* MetalTextureCache::GetTextureForBinding(
     return get_null_texture_for_dimension();
   }
 
+  if (!::cvars::metal_debug_null_texture_formats.empty()) {
+    static const std::string* parsed_list = nullptr;
+    static uint64_t null_format_mask = 0;
+    if (parsed_list != &::cvars::metal_debug_null_texture_formats) {
+      parsed_list = &::cvars::metal_debug_null_texture_formats;
+      const std::string& list = *parsed_list;
+      size_t pos = 0;
+      while (pos < list.size()) {
+        size_t comma = list.find(',', pos);
+        std::string item = list.substr(
+            pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        int value = std::atoi(item.c_str());
+        if (value >= 0 && value < 64) {
+          null_format_mask |= uint64_t(1) << value;
+        }
+        if (comma == std::string::npos) {
+          break;
+        }
+        pos = comma + 1;
+      }
+      XELOGI("Metal: debug null texture format mask {:016X}", null_format_mask);
+    }
+    if (null_format_mask & (uint64_t(1) << uint32_t(binding->key.format))) {
+      return get_null_texture_for_dimension();
+    }
+  }
+  if (::cvars::metal_debug_log_texture_formats) {
+    static std::unordered_set<uint64_t> logged_formats;
+    const TextureKey& lk = binding->key;
+    uint64_t tag = uint64_t(lk.format) | (uint64_t(lk.dimension) << 6) |
+                   (uint64_t(binding->swizzled_signs) << 8) |
+                   (uint64_t(binding->host_swizzle & 0xFFF) << 16) |
+                   (uint64_t(lk.endianness) << 28) |
+                   (uint64_t(is_signed) << 30) | (uint64_t(lk.tiled) << 31) |
+                   (uint64_t(lk.packed_mips) << 32) |
+                   (uint64_t(lk.scaled_resolve) << 33) |
+                   (uint64_t(lk.signed_separate) << 34) |
+                   (uint64_t(texture == binding->texture_signed) << 35) |
+                   (uint64_t(binding->integer_scale_bits) << 36);
+    if (logged_formats.insert(tag).second) {
+      XELOGI(
+          "TexFmt format={} ({}) dim={} fetch_dim={} {}x{}x{} mips={} "
+          "signs={:02X} host_swizzle={:03X} endian={} signed_fetch={} "
+          "signed_tex={} tiled={} packed_mips={} scaled_resolve={} "
+          "int_scale={:08X} base={:08X} fetch={}",
+          uint32_t(lk.format), FormatInfo::GetName(lk.format),
+          uint32_t(lk.dimension), uint32_t(dimension), lk.GetWidth(),
+          lk.GetHeight(), lk.GetDepthOrArraySize(), lk.mip_max_level + 1,
+          binding->swizzled_signs, binding->host_swizzle & 0xFFF,
+          uint32_t(lk.endianness), is_signed ? 1 : 0,
+          texture == binding->texture_signed ? 1 : 0, lk.tiled ? 1 : 0,
+          lk.packed_mips ? 1 : 0, lk.scaled_resolve ? 1 : 0,
+          binding->integer_scale_bits, lk.base_page << 12, fetch_constant);
+    }
+  }
   texture->MarkAsUsed();
   auto* metal_texture = static_cast<MetalTexture*>(texture);
   MTL::Texture* result = nullptr;
@@ -2877,6 +2954,10 @@ MTL::SamplerState* MetalTextureCache::GetOrCreateSampler(
       parameters.aniso_filter == xenos::AnisoFilter::kDisabled &&
       !parameters.mip_linear) {
     max_lod += 0.25f;
+  }
+  if (::cvars::metal_debug_max_lod >= 0.0) {
+    max_lod = std::max(float(parameters.mip_min_level),
+                       std::min(max_lod, float(::cvars::metal_debug_max_lod)));
   }
   desc->setLodMaxClamp(max_lod);
   desc->setLodAverage(false);
