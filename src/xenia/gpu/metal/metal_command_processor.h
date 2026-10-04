@@ -323,11 +323,17 @@ class MetalCommandProcessor : public CommandProcessor {
   bool LoadPipelineDiskCache(const std::filesystem::path& path,
                              std::vector<PipelineDiskCacheEntry>* entries);
   bool AppendPipelineDiskCacheEntry(const PipelineDiskCacheEntry& entry);
+  static void WritePipelineDiskCacheEntry(FILE* file,
+                                          const PipelineDiskCacheEntry& entry);
   bool InitializePipelineBinaryArchive(
       const std::filesystem::path& archive_path);
   void SerializePipelineBinaryArchive();
-  void PrewarmPipelineBinaryArchive(
-      const std::vector<PipelineDiskCacheEntry>& entries);
+  // Stable across runs (unlike the in-memory pipeline key, which contains
+  // shader object pointers): built from the shader cache keys and the state.
+  static uint64_t ComputeStablePipelineKey(const PipelineDiskCacheEntry& entry);
+  void StartPipelinePrewarm(std::vector<PipelineDiskCacheEntry> entries);
+  void StopPipelinePrewarm();
+  void PipelinePrewarmWorkerMain(std::vector<PipelineDiskCacheEntry> entries);
 
   // Constants for MSC descriptor heap sizes.
   // The root signature declares 1025 SRVs / 257 samplers per space, but the
@@ -747,6 +753,12 @@ class MetalCommandProcessor : public CommandProcessor {
   MTL::BinaryArchive* pipeline_binary_archive_ = nullptr;
   bool pipeline_binary_archive_dirty_ = false;
   std::mutex pipeline_binary_archive_mutex_;
+  // Pipelines from previous runs created on a background thread at title
+  // launch, by stable pipeline key.
+  std::thread pipeline_prewarm_thread_;
+  std::atomic<bool> pipeline_prewarm_stop_{false};
+  std::mutex pipeline_prewarm_mutex_;
+  std::unordered_map<uint64_t, MTL::RenderPipelineState*> pipeline_prewarmed_;
 #endif  // METAL_SHADER_CONVERTER_AVAILABLE
 
   std::atomic<uint64_t> completed_command_buffers_{0};

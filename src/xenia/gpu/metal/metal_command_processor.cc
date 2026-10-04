@@ -135,6 +135,18 @@ DEFINE_string(metal_shared_memory_copy_titles, "545407EE",
               "the frame). GPU writes (resolves) then aren't visible to the "
               "guest CPU.",
               "Metal");
+DEFINE_bool(metal_pipeline_prewarm, true,
+            "Create the pipelines recorded in previous runs on a background "
+            "thread at title launch, so they don't cause hitches when first "
+            "used in game.",
+            "Metal");
+DEFINE_string(metal_sync_all_gpu_work_packets, "ews",
+              "For metal_sync_all_gpu_work_for_guest_titles: the PM4 packets "
+              "at which all GPU work is waited for (int = INTERRUPT, r2m = "
+              "REG_TO_MEM, mw = MEM_WRITE, cw = COND_WRITE, ews = "
+              "EVENT_WRITE_SHD, other). EVENT_WRITE_SHD alone is enough for Fable "
+              "II.",
+              "Metal");
 DEFINE_string(metal_sync_all_gpu_work_for_guest_titles, "4D5307F1",
               "Comma-separated title IDs (hex) for which every guest-visible "
               "GPU sync point (fences, interrupts) waits for all submitted GPU "
@@ -725,10 +737,11 @@ struct PerfStats {
   uint32_t archive_hits = 0;
   uint32_t archive_misses = 0;
   uint32_t archive_misses_no_fragment = 0;
+  uint32_t prewarm_hits = 0;
   // Guest-visible sync point waits by PM4 packet: INTERRUPT, REG_TO_MEM,
   // MEM_WRITE, COND_WRITE, EVENT_WRITE_SHD, other.
   uint32_t sync_waits[6] = {};
-  uint32_t sync_points = 0;
+  uint32_t sync_points[6] = {};
   uint64_t depth_only_tess = 0;
   uint64_t depth_only_plain = 0;
 };
@@ -777,8 +790,9 @@ void PerfOnSwap() {
         "pipelines_slow={} ({:.1f}ms, max {:.1f}ms) shaders={} ({:.1f}ms) "
         "geom_skipped={} depth_only/frame={} (tess {}) "
         "async_pipelines={} async_skipped_draws={} async_shaders={} "
-        "archive_hits={} archive_misses={} (no_fragment {}) "
-        "sync_points={} sync_waits(int/r2m/mw/cw/ews/other)={}/{}/{}/{}/{}/{}",
+        "archive_hits={} archive_misses={} (no_fragment {}) prewarm_hits={} "
+        "sync_points(int/r2m/mw/cw/ews/other)={}/{}/{}/{}/{}/{} "
+        "sync_waits={}/{}/{}/{}/{}/{}",
         p.swaps / secs, p.max_frame_ns / 1e6, p.frames_over_40ms,
         p.swaps ? p.draws / p.swaps : 0, p.wait_ns / 1e6 / secs, p.waits,
         p.pipelines_slow, p.pipelines_ns / 1e6, p.pipelines_max_ns / 1e6,
@@ -786,7 +800,9 @@ void PerfOnSwap() {
         p.swaps ? (p.depth_only_tess + p.depth_only_plain) / p.swaps : 0,
         p.swaps ? p.depth_only_tess / p.swaps : 0, p.async_pipelines,
         p.async_skipped_draws, p.async_shaders, p.archive_hits,
-        p.archive_misses, p.archive_misses_no_fragment, p.sync_points,
+        p.archive_misses, p.archive_misses_no_fragment, p.prewarm_hits,
+        p.sync_points[0], p.sync_points[1], p.sync_points[2],
+        p.sync_points[3], p.sync_points[4], p.sync_points[5],
         p.sync_waits[0], p.sync_waits[1], p.sync_waits[2], p.sync_waits[3],
         p.sync_waits[4], p.sync_waits[5]);
   }
@@ -2384,19 +2400,16 @@ bool MetalCommandProcessor::InitializeShaderStorageInternal(
     InitializePipelineBinaryArchive(pipeline_binary_archive_path_);
   }
 
-  bool prewarm_binary_archive = false;
-  {
-    std::lock_guard<std::mutex> lock(pipeline_binary_archive_mutex_);
-    prewarm_binary_archive = pipeline_binary_archive_ != nullptr;
-  }
-  if (blocking && prewarm_binary_archive && !pipeline_disk_cache_entries_.empty()) {
-    PrewarmPipelineBinaryArchive(pipeline_disk_cache_entries_);
+  if (::cvars::metal_pipeline_prewarm &&
+      !pipeline_disk_cache_entries_.empty()) {
+    StartPipelinePrewarm(pipeline_disk_cache_entries_);
   }
 
   return true;
 }
 
 void MetalCommandProcessor::ShutdownShaderStorage() {
+  StopPipelinePrewarm();
   {
     std::lock_guard<std::mutex> lock(pipeline_binary_archive_mutex_);
     if (pipeline_binary_archive_) {
@@ -2452,108 +2465,143 @@ bool MetalCommandProcessor::LoadPipelineDiskCache(
   }
   entries->clear();
   pipeline_disk_cache_keys_.clear();
+  if (pipeline_disk_cache_file_) {
+    std::fclose(pipeline_disk_cache_file_);
+    pipeline_disk_cache_file_ = nullptr;
+  }
 
-  pipeline_disk_cache_file_ = xe::filesystem::OpenFile(path, "a+b");
+  // Read with a separate read-only stream: with "a+" the initial position on
+  // macOS is the end of the file, so nothing was ever loaded and a new file
+  // header was appended on every launch.
+  bool needs_rewrite = true;
+  size_t raw_entries = 0;
+  if (FILE* file = xe::filesystem::OpenFile(path, "rb")) {
+    PipelineDiskCacheHeader header = {};
+    if (std::fread(&header, sizeof(header), 1, file) == 1 &&
+        header.magic == kPipelineDiskCacheMagic &&
+        header.version == kPipelineDiskCacheVersion) {
+      needs_rewrite = false;
+      while (true) {
+        PipelineDiskCacheEntryHeader entry_header = {};
+        if (std::fread(&entry_header, sizeof(entry_header), 1, file) != 1) {
+          break;
+        }
+        if (entry_header.entry_size == kPipelineDiskCacheMagic) {
+          // A stray file header appended by older versions.
+          xe::filesystem::Seek(
+              file, sizeof(PipelineDiskCacheHeader) - sizeof(entry_header),
+              SEEK_CUR);
+          needs_rewrite = true;
+          continue;
+        }
+        if (entry_header.entry_size < sizeof(PipelineDiskCacheEntryBase) ||
+            entry_header.entry_size > kPipelineDiskCacheMaxEntrySize) {
+          needs_rewrite = true;
+          break;
+        }
+        PipelineDiskCacheEntryBase base = {};
+        if (std::fread(&base, sizeof(base), 1, file) != 1) {
+          needs_rewrite = true;
+          break;
+        }
+        size_t expected_size = sizeof(PipelineDiskCacheEntryBase) +
+                               size_t(base.vertex_attribute_count) *
+                                   sizeof(PipelineDiskCacheVertexAttribute) +
+                               size_t(base.vertex_layout_count) *
+                                   sizeof(PipelineDiskCacheVertexLayout);
+        if (entry_header.entry_size != expected_size) {
+          xe::filesystem::Seek(
+              file, entry_header.entry_size - sizeof(PipelineDiskCacheEntryBase),
+              SEEK_CUR);
+          needs_rewrite = true;
+          continue;
+        }
+        PipelineDiskCacheEntry entry = {};
+        entry.vertex_shader_cache_key = base.vertex_shader_cache_key;
+        entry.pixel_shader_cache_key = base.pixel_shader_cache_key;
+        entry.sample_count = base.sample_count;
+        entry.depth_format = base.depth_format;
+        entry.stencil_format = base.stencil_format;
+        std::memcpy(entry.color_formats, base.color_formats,
+                    sizeof(base.color_formats));
+        entry.normalized_color_mask = base.normalized_color_mask;
+        entry.alpha_to_mask_enable = base.alpha_to_mask_enable;
+        std::memcpy(entry.blendcontrol, base.blendcontrol,
+                    sizeof(base.blendcontrol));
+        entry.vertex_attributes.resize(base.vertex_attribute_count);
+        if (base.vertex_attribute_count &&
+            std::fread(entry.vertex_attributes.data(),
+                       sizeof(PipelineDiskCacheVertexAttribute),
+                       base.vertex_attribute_count,
+                       file) != base.vertex_attribute_count) {
+          needs_rewrite = true;
+          break;
+        }
+        entry.vertex_layouts.resize(base.vertex_layout_count);
+        if (base.vertex_layout_count &&
+            std::fread(entry.vertex_layouts.data(),
+                       sizeof(PipelineDiskCacheVertexLayout),
+                       base.vertex_layout_count,
+                       file) != base.vertex_layout_count) {
+          needs_rewrite = true;
+          break;
+        }
+        ++raw_entries;
+        // Older versions stored a key containing object pointers - recompute
+        // the stable one, and drop duplicates.
+        entry.pipeline_key = ComputeStablePipelineKey(entry);
+        if (base.pipeline_key != entry.pipeline_key) {
+          needs_rewrite = true;
+        }
+        if (!pipeline_disk_cache_keys_.insert(entry.pipeline_key).second) {
+          needs_rewrite = true;
+          continue;
+        }
+        entries->push_back(std::move(entry));
+      }
+    }
+    std::fclose(file);
+  }
+
+  if (needs_rewrite) {
+    std::filesystem::path temp_path = path;
+    temp_path += ".tmp";
+    bool written = false;
+    if (FILE* file = xe::filesystem::OpenFile(temp_path, "wb")) {
+      PipelineDiskCacheHeader header = {};
+      header.magic = kPipelineDiskCacheMagic;
+      header.version = kPipelineDiskCacheVersion;
+      written = std::fwrite(&header, sizeof(header), 1, file) == 1;
+      for (const auto& entry : *entries) {
+        WritePipelineDiskCacheEntry(file, entry);
+      }
+      written = std::fflush(file) == 0 && written;
+      std::fclose(file);
+    }
+    std::error_code ec;
+    if (written) {
+      std::filesystem::rename(temp_path, path, ec);
+    }
+    if (!written || ec) {
+      XELOGW("Metal pipeline disk cache: Failed to rewrite {}", path.string());
+      std::filesystem::remove(temp_path, ec);
+    } else if (raw_entries) {
+      XELOGI("Metal pipeline disk cache: compacted {} entries to {} unique",
+             raw_entries, entries->size());
+    }
+  }
+
+  pipeline_disk_cache_file_ = xe::filesystem::OpenFile(path, "ab");
   if (!pipeline_disk_cache_file_) {
     XELOGW("Metal pipeline disk cache: Failed to open {}", path.string());
     return false;
   }
-
-  PipelineDiskCacheHeader header = {};
-  if (std::fread(&header, sizeof(header), 1, pipeline_disk_cache_file_) != 1 ||
-      header.magic != kPipelineDiskCacheMagic ||
-      header.version != kPipelineDiskCacheVersion) {
-    header.magic = kPipelineDiskCacheMagic;
-    header.version = kPipelineDiskCacheVersion;
-    header.reserved[0] = 0;
-    header.reserved[1] = 0;
-    xe::filesystem::Seek(pipeline_disk_cache_file_, 0, SEEK_SET);
-    std::fwrite(&header, sizeof(header), 1, pipeline_disk_cache_file_);
-    std::fflush(pipeline_disk_cache_file_);
-    xe::filesystem::Seek(pipeline_disk_cache_file_, 0, SEEK_END);
-    return true;
-  }
-
-  while (true) {
-    PipelineDiskCacheEntryHeader entry_header = {};
-    if (std::fread(&entry_header, sizeof(entry_header), 1,
-                   pipeline_disk_cache_file_) != 1) {
-      break;
-    }
-
-    if (entry_header.entry_size < sizeof(PipelineDiskCacheEntryBase) ||
-        entry_header.entry_size > kPipelineDiskCacheMaxEntrySize) {
-      break;
-    }
-
-    PipelineDiskCacheEntryBase base = {};
-    if (std::fread(&base, sizeof(base), 1, pipeline_disk_cache_file_) != 1) {
-      break;
-    }
-
-    size_t expected_size = sizeof(PipelineDiskCacheEntryBase) +
-                           size_t(base.vertex_attribute_count) *
-                               sizeof(PipelineDiskCacheVertexAttribute) +
-                           size_t(base.vertex_layout_count) *
-                               sizeof(PipelineDiskCacheVertexLayout);
-    if (entry_header.entry_size != expected_size) {
-      xe::filesystem::Seek(
-          pipeline_disk_cache_file_,
-          entry_header.entry_size - sizeof(PipelineDiskCacheEntryBase),
-          SEEK_CUR);
-      continue;
-    }
-
-    PipelineDiskCacheEntry entry = {};
-    entry.pipeline_key = base.pipeline_key;
-    entry.vertex_shader_cache_key = base.vertex_shader_cache_key;
-    entry.pixel_shader_cache_key = base.pixel_shader_cache_key;
-    entry.sample_count = base.sample_count;
-    entry.depth_format = base.depth_format;
-    entry.stencil_format = base.stencil_format;
-    std::memcpy(entry.color_formats, base.color_formats,
-                sizeof(base.color_formats));
-    entry.normalized_color_mask = base.normalized_color_mask;
-    entry.alpha_to_mask_enable = base.alpha_to_mask_enable;
-    std::memcpy(entry.blendcontrol, base.blendcontrol,
-                sizeof(base.blendcontrol));
-
-    entry.vertex_attributes.resize(base.vertex_attribute_count);
-    if (base.vertex_attribute_count) {
-      if (std::fread(entry.vertex_attributes.data(),
-                     sizeof(PipelineDiskCacheVertexAttribute),
-                     base.vertex_attribute_count, pipeline_disk_cache_file_) !=
-          base.vertex_attribute_count) {
-        break;
-      }
-    }
-    entry.vertex_layouts.resize(base.vertex_layout_count);
-    if (base.vertex_layout_count) {
-      if (std::fread(entry.vertex_layouts.data(),
-                     sizeof(PipelineDiskCacheVertexLayout),
-                     base.vertex_layout_count,
-                     pipeline_disk_cache_file_) != base.vertex_layout_count) {
-        break;
-      }
-    }
-
-    entries->push_back(std::move(entry));
-    pipeline_disk_cache_keys_.insert(base.pipeline_key);
-  }
-
-  xe::filesystem::Seek(pipeline_disk_cache_file_, 0, SEEK_END);
+  XELOGI("Metal pipeline disk cache: {} pipelines", entries->size());
   return true;
 }
 
-bool MetalCommandProcessor::AppendPipelineDiskCacheEntry(
-    const PipelineDiskCacheEntry& entry) {
-  if (!pipeline_disk_cache_file_) {
-    return false;
-  }
-  if (!pipeline_disk_cache_keys_.insert(entry.pipeline_key).second) {
-    return false;
-  }
-
+void MetalCommandProcessor::WritePipelineDiskCacheEntry(
+    FILE* file, const PipelineDiskCacheEntry& entry) {
   PipelineDiskCacheEntryBase base = {};
   base.pipeline_key = entry.pipeline_key;
   base.vertex_shader_cache_key = entry.vertex_shader_cache_key;
@@ -2569,7 +2617,31 @@ bool MetalCommandProcessor::AppendPipelineDiskCacheEntry(
   base.vertex_attribute_count =
       static_cast<uint32_t>(entry.vertex_attributes.size());
   base.vertex_layout_count = static_cast<uint32_t>(entry.vertex_layouts.size());
+  PipelineDiskCacheEntryHeader entry_header = {};
+  entry_header.entry_size = static_cast<uint32_t>(
+      sizeof(PipelineDiskCacheEntryBase) +
+      entry.vertex_attributes.size() *
+          sizeof(PipelineDiskCacheVertexAttribute) +
+      entry.vertex_layouts.size() * sizeof(PipelineDiskCacheVertexLayout));
+  std::fwrite(&entry_header, sizeof(entry_header), 1, file);
+  std::fwrite(&base, sizeof(base), 1, file);
+  if (!entry.vertex_attributes.empty()) {
+    std::fwrite(entry.vertex_attributes.data(),
+                sizeof(PipelineDiskCacheVertexAttribute),
+                entry.vertex_attributes.size(), file);
+  }
+  if (!entry.vertex_layouts.empty()) {
+    std::fwrite(entry.vertex_layouts.data(),
+                sizeof(PipelineDiskCacheVertexLayout),
+                entry.vertex_layouts.size(), file);
+  }
+}
 
+bool MetalCommandProcessor::AppendPipelineDiskCacheEntry(
+    const PipelineDiskCacheEntry& entry) {
+  if (!pipeline_disk_cache_file_) {
+    return false;
+  }
   size_t entry_size =
       sizeof(PipelineDiskCacheEntryBase) +
       entry.vertex_attributes.size() *
@@ -2578,23 +2650,10 @@ bool MetalCommandProcessor::AppendPipelineDiskCacheEntry(
   if (entry_size > kPipelineDiskCacheMaxEntrySize) {
     return false;
   }
-
-  PipelineDiskCacheEntryHeader entry_header = {};
-  entry_header.entry_size = static_cast<uint32_t>(entry_size);
-
-  std::fwrite(&entry_header, sizeof(entry_header), 1,
-              pipeline_disk_cache_file_);
-  std::fwrite(&base, sizeof(base), 1, pipeline_disk_cache_file_);
-  if (!entry.vertex_attributes.empty()) {
-    std::fwrite(entry.vertex_attributes.data(),
-                sizeof(PipelineDiskCacheVertexAttribute),
-                entry.vertex_attributes.size(), pipeline_disk_cache_file_);
+  if (!pipeline_disk_cache_keys_.insert(entry.pipeline_key).second) {
+    return false;
   }
-  if (!entry.vertex_layouts.empty()) {
-    std::fwrite(entry.vertex_layouts.data(),
-                sizeof(PipelineDiskCacheVertexLayout),
-                entry.vertex_layouts.size(), pipeline_disk_cache_file_);
-  }
+  WritePipelineDiskCacheEntry(pipeline_disk_cache_file_, entry);
   std::fflush(pipeline_disk_cache_file_);
   pipeline_disk_cache_entries_.push_back(entry);
   return true;
@@ -2664,23 +2723,80 @@ void MetalCommandProcessor::SerializePipelineBinaryArchive() {
   pipeline_binary_archive_dirty_ = false;
 }
 
-void MetalCommandProcessor::PrewarmPipelineBinaryArchive(
-    const std::vector<PipelineDiskCacheEntry>& entries) {
+uint64_t MetalCommandProcessor::ComputeStablePipelineKey(
+    const PipelineDiskCacheEntry& entry) {
+  struct {
+    uint64_t vertex_shader_cache_key;
+    uint64_t pixel_shader_cache_key;
+    uint32_t sample_count;
+    uint32_t depth_format;
+    uint32_t stencil_format;
+    uint32_t color_formats[4];
+    uint32_t normalized_color_mask;
+    uint32_t alpha_to_mask_enable;
+    uint32_t blendcontrol[4];
+  } key_data = {};
+  key_data.vertex_shader_cache_key = entry.vertex_shader_cache_key;
+  key_data.pixel_shader_cache_key = entry.pixel_shader_cache_key;
+  key_data.sample_count = entry.sample_count;
+  key_data.depth_format = entry.depth_format;
+  key_data.stencil_format = entry.stencil_format;
+  std::memcpy(key_data.color_formats, entry.color_formats,
+              sizeof(key_data.color_formats));
+  key_data.normalized_color_mask = entry.normalized_color_mask;
+  key_data.alpha_to_mask_enable = entry.alpha_to_mask_enable;
+  std::memcpy(key_data.blendcontrol, entry.blendcontrol,
+              sizeof(key_data.blendcontrol));
+  return XXH3_64bits(&key_data, sizeof(key_data));
+}
+
+void MetalCommandProcessor::StartPipelinePrewarm(
+    std::vector<PipelineDiskCacheEntry> entries) {
+  StopPipelinePrewarm();
+  pipeline_prewarm_stop_ = false;
+  pipeline_prewarm_thread_ = std::thread(
+      [this, entries = std::move(entries)]() mutable {
+        xe::threading::set_name("Metal Pipeline Prewarm");
+        PipelinePrewarmWorkerMain(std::move(entries));
+      });
+}
+
+void MetalCommandProcessor::StopPipelinePrewarm() {
+  pipeline_prewarm_stop_ = true;
+  if (pipeline_prewarm_thread_.joinable()) {
+    pipeline_prewarm_thread_.join();
+  }
+  std::lock_guard<std::mutex> lock(pipeline_prewarm_mutex_);
+  for (auto& pair : pipeline_prewarmed_) {
+    pair.second->release();
+  }
+  pipeline_prewarmed_.clear();
+}
+
+void MetalCommandProcessor::PipelinePrewarmWorkerMain(
+    std::vector<PipelineDiskCacheEntry> entries) {
   if (entries.empty()) {
     return;
   }
   if (!g_metal_shader_cache || !g_metal_shader_cache->IsInitialized()) {
     return;
   }
-  {
-    std::lock_guard<std::mutex> lock(pipeline_binary_archive_mutex_);
-    if (!pipeline_binary_archive_) {
-      return;
-    }
-  }
 
-  size_t prewarmed = 0;
+  int64_t prewarm_start_ns = PerfNowNs();
+  size_t from_archive = 0, compiled = 0;
+  std::unordered_set<uint64_t> seen;
   for (const auto& entry : entries) {
+    if (pipeline_prewarm_stop_.load(std::memory_order_relaxed)) {
+      break;
+    }
+    uint64_t stable_key = ComputeStablePipelineKey(entry);
+    if (!seen.insert(stable_key).second) {
+      continue;
+    }
+    struct PoolScope {
+      NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+      ~PoolScope() { pool->release(); }
+    } pool_scope;
     MetalShaderCache::CachedMetallib vs_cached;
     if (!g_metal_shader_cache->Load(entry.vertex_shader_cache_key,
                                     &vs_cached)) {
@@ -2721,6 +2837,17 @@ void MetalCommandProcessor::PrewarmPipelineBinaryArchive(
           ps_function = ps_library->newFunction(ps_name);
         }
       }
+    }
+
+    if (entry.pixel_shader_cache_key && !ps_function) {
+      // A pipeline without the pixel shader it was recorded with would be a
+      // different pipeline under the same key.
+      if (ps_library) {
+        ps_library->release();
+      }
+      vs_function->release();
+      vs_library->release();
+      continue;
     }
 
     MTL::RenderPipelineDescriptor* desc =
@@ -2813,15 +2940,38 @@ void MetalCommandProcessor::PrewarmPipelineBinaryArchive(
       vertex_desc->release();
     }
 
+    // Look the pipeline up in the binary archive first (cheap); otherwise
+    // compile it into the archive (under the archive lock, so it doesn't race
+    // with a background save) and create it from there.
+    MTL::RenderPipelineState* pipeline = nullptr;
     {
       std::lock_guard<std::mutex> lock(pipeline_binary_archive_mutex_);
       if (pipeline_binary_archive_ && !g_archive_save_in_progress.load()) {
-        NS::Array* archives = NS::Array::array(pipeline_binary_archive_);
-        desc->setBinaryArchives(archives);
-        if (pipeline_binary_archive_->addRenderPipelineFunctions(desc, &error)) {
+        desc->setBinaryArchives(NS::Array::array(pipeline_binary_archive_));
+        NS::Error* hit_error = nullptr;
+        pipeline = device_->newRenderPipelineState(
+            desc, MTL::PipelineOptionFailOnBinaryArchiveMiss, nullptr,
+            &hit_error);
+        if (pipeline) {
+          ++from_archive;
+        } else if (pipeline_binary_archive_->addRenderPipelineFunctions(
+                       desc, &error)) {
           pipeline_binary_archive_dirty_ = true;
-          ++prewarmed;
         }
+      }
+    }
+    if (!pipeline) {
+      error = nullptr;
+      pipeline = device_->newRenderPipelineState(desc, &error);
+      if (pipeline) {
+        ++compiled;
+      }
+    }
+    if (pipeline) {
+      std::lock_guard<std::mutex> lock(pipeline_prewarm_mutex_);
+      auto inserted = pipeline_prewarmed_.emplace(stable_key, pipeline);
+      if (!inserted.second) {
+        pipeline->release();
       }
     }
     desc->release();
@@ -2834,7 +2984,13 @@ void MetalCommandProcessor::PrewarmPipelineBinaryArchive(
       ps_library->release();
     }
   }
+  XELOGI("Metal: pipeline prewarm: {} unique pipelines ({} from the binary "
+         "archive, {} compiled) in {:.1f}ms{}",
+         seen.size(), from_archive, compiled,
+         (PerfNowNs() - prewarm_start_ns) / 1e6,
+         pipeline_prewarm_stop_.load() ? " (stopped)" : "");
 }
+
 #endif  // METAL_SHADER_CONVERTER_AVAILABLE
 
 void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
@@ -2867,8 +3023,12 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
       // it's done on a separate thread (MTLBinaryArchive is thread-safe).
       MTL::BinaryArchive* archive = nullptr;
       {
-        std::lock_guard<std::mutex> lock(pipeline_binary_archive_mutex_);
-        if (pipeline_binary_archive_ && pipeline_binary_archive_dirty_ &&
+        // Don't block the GPU thread if the prewarm thread is compiling into
+        // the archive - try again on a later swap.
+        std::unique_lock<std::mutex> lock(pipeline_binary_archive_mutex_,
+                                          std::try_to_lock);
+        if (lock.owns_lock() && pipeline_binary_archive_ &&
+            pipeline_binary_archive_dirty_ &&
             !g_archive_save_in_progress.load()) {
           archive = pipeline_binary_archive_;
           archive->retain();
@@ -5885,7 +6045,7 @@ bool MetalCommandProcessor::IsCurrentTitleInList(
                           list);
 }
 
-static void PerfCountGuestSyncWait(const char* reason) {
+static size_t GuestSyncReasonIndex(const char* reason) {
   static const char* const kNames[] = {"INTERRUPT", "REG_TO_MEM", "MEM_WRITE",
                                        "COND_WRITE", "EVENT_WRITE_SHD"};
   size_t index = 5;
@@ -5897,11 +6057,15 @@ static void PerfCountGuestSyncWait(const char* reason) {
       }
     }
   }
-  ++g_perf.sync_waits[index];
+  return index;
+}
+
+static void PerfCountGuestSyncWait(const char* reason) {
+  ++g_perf.sync_waits[GuestSyncReasonIndex(reason)];
 }
 
 void MetalCommandProcessor::SyncGpuWritesForGuest(const char* reason) {
-  ++g_perf.sync_points;
+  ++g_perf.sync_points[GuestSyncReasonIndex(reason)];
   {
     uint32_t title_id = current_title_id_.load(std::memory_order_relaxed);
     if (title_id != sync_all_titles_checked_id_) {
@@ -5913,7 +6077,24 @@ void MetalCommandProcessor::SyncGpuWritesForGuest(const char* reason) {
                title_id);
       }
     }
-    if (sync_all_titles_match_) {
+    static const std::string* sync_all_packets_parsed = nullptr;
+    static uint32_t sync_all_packet_mask = 0x3F;
+    if (sync_all_packets_parsed != &::cvars::metal_sync_all_gpu_work_packets) {
+      sync_all_packets_parsed = &::cvars::metal_sync_all_gpu_work_packets;
+      static const char* const kShortNames[] = {"int", "r2m", "mw",
+                                                "cw",  "ews", "other"};
+      sync_all_packet_mask = 0;
+      for (uint32_t i = 0; i < 6; ++i) {
+        if (::cvars::metal_sync_all_gpu_work_packets.find(kShortNames[i]) !=
+            std::string::npos) {
+          sync_all_packet_mask |= 1u << i;
+        }
+      }
+      XELOGI("Metal: full GPU work sync packet mask {:02X}",
+             sync_all_packet_mask);
+    }
+    if (sync_all_titles_match_ &&
+        (sync_all_packet_mask & (1u << GuestSyncReasonIndex(reason)))) {
       // With zero-copy shared memory the GPU reads guest memory when it
       // executes, not when commands are recorded - so the guest must not be
       // told the GPU is done before it really is.
@@ -6970,7 +7151,6 @@ MTL::RenderPipelineState* MetalCommandProcessor::GetOrCreatePipelineState(
   bool record_disk_entry = ::cvars::metal_pipeline_disk_cache &&
                            pipeline_disk_cache_file_ && !depth_only_float24;
   if (record_disk_entry) {
-    disk_entry.pipeline_key = key;
     disk_entry.vertex_shader_cache_key = MetalShaderCache::GetCacheKey(
         vertex_translation->shader().ucode_data_hash(),
         vertex_translation->modification(),
@@ -6996,6 +7176,24 @@ MTL::RenderPipelineState* MetalCommandProcessor::GetOrCreatePipelineState(
   auto it = pipeline_cache_.find(key);
   if (it != pipeline_cache_.end()) {
     return it->second;
+  }
+
+  if (record_disk_entry) {
+    disk_entry.pipeline_key = ComputeStablePipelineKey(disk_entry);
+    MTL::RenderPipelineState* prewarmed = nullptr;
+    if (!pixel_translation || pixel_translation->metal_function()) {
+      std::lock_guard<std::mutex> lock(pipeline_prewarm_mutex_);
+      auto prewarmed_it = pipeline_prewarmed_.find(disk_entry.pipeline_key);
+      if (prewarmed_it != pipeline_prewarmed_.end()) {
+        prewarmed = prewarmed_it->second;
+        prewarmed->retain();
+      }
+    }
+    if (prewarmed) {
+      ++g_perf.prewarm_hits;
+      pipeline_cache_[key] = prewarmed;
+      return prewarmed;
+    }
   }
 
   bool use_async_pipeline = ::cvars::metal_async_pipeline_creation;
@@ -7262,8 +7460,12 @@ MTL::RenderPipelineState* MetalCommandProcessor::GetOrCreatePipelineState(
     // and don't skip the draw.
     bool archive_attached = false;
     {
-      std::lock_guard<std::mutex> lock(pipeline_binary_archive_mutex_);
-      if (pipeline_binary_archive_ && !g_archive_save_in_progress.load()) {
+      // try_lock: if the prewarm thread is compiling into the archive, go
+      // straight to async creation instead of waiting for it.
+      std::unique_lock<std::mutex> lock(pipeline_binary_archive_mutex_,
+                                        std::try_to_lock);
+      if (lock.owns_lock() && pipeline_binary_archive_ &&
+          !g_archive_save_in_progress.load()) {
         desc->setBinaryArchives(NS::Array::array(pipeline_binary_archive_));
         archive_attached = true;
       }
