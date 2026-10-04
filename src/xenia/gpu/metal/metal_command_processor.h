@@ -98,6 +98,8 @@ class MetalCommandProcessor : public CommandProcessor {
   uint64_t GetCompletedSubmission() const override;
   MTL::CommandBuffer* EnsureCommandBuffer();
   void EndRenderEncoder();
+  // Whether the running title is in a comma-separated hex title ID list.
+  bool IsCurrentTitleInList(const std::string& list) const;
   // Orders render pass writes to render targets before later compute
   // encoders (EDRAM dumps) that read them in the same command buffer.
   void SignalRenderTargetFence(MTL::RenderCommandEncoder* encoder);
@@ -763,7 +765,7 @@ class MetalCommandProcessor : public CommandProcessor {
   void NoteMemExportWritten();
   void CommitAndWaitCurrentCommandBuffer();
   bool memexport_sync_pending_ = false;
-  void SyncGpuWritesForGuest();
+  void SyncGpuWritesForGuest(const char* reason = nullptr);
   bool gpu_writes_pending_for_guest_ = false;
   uint64_t guest_gpu_syncs_ = 0;
   std::atomic<uint32_t> current_title_id_{0};

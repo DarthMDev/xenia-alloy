@@ -102,6 +102,11 @@ DEFINE_bool(metal_force_bc_decompress, false,
 DEFINE_bool(metal_force_linear_filter, false,
             "Force linear min/mag/mip filtering on all samplers (debug).",
             "GPU");
+DEFINE_string(metal_force_linear_filter_titles, "4D5307F1",
+              "Comma-separated title IDs (hex) for which "
+              "metal_force_linear_filter is enabled automatically (4D5307F1 = "
+              "Fable II, all regions).",
+              "GPU");
 
 namespace xe {
 namespace gpu {
@@ -2824,7 +2829,10 @@ MTL::SamplerState* MetalTextureCache::GetOrCreateSampler(
           uint32_t(parameters.clamp_y), uint32_t(parameters.clamp_z));
     }
   }
-  if (::cvars::metal_force_linear_filter) {
+  if (::cvars::metal_force_linear_filter ||
+      (command_processor_ &&
+       command_processor_->IsCurrentTitleInList(
+           ::cvars::metal_force_linear_filter_titles))) {
     parameters.mag_linear = 1;
     parameters.min_linear = 1;
     parameters.mip_linear = 1;

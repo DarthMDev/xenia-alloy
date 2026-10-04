@@ -135,12 +135,12 @@ DEFINE_string(metal_shared_memory_copy_titles, "545407EE",
               "the frame). GPU writes (resolves) then aren't visible to the "
               "guest CPU.",
               "Metal");
-DEFINE_string(metal_sync_all_gpu_work_for_guest_titles, "",
+DEFINE_string(metal_sync_all_gpu_work_for_guest_titles, "4D5307F1",
               "Comma-separated title IDs (hex) for which every guest-visible "
               "GPU sync point (fences, interrupts) waits for all submitted GPU "
               "work. Needed with zero-copy shared memory when a title reuses "
-              "vertex/constant memory right after a fence (545407EE = The "
-              "Darkness: garbage band at the top of the frame).",
+              "vertex/constant memory right after a fence (4D5307F1 = Fable "
+              "II: large white polygons flashing over glowing effects).",
               "Metal");
 DEFINE_string(metal_sync_gpu_writes_for_guest_titles, "4D5307F1",
               "Comma-separated title IDs (hex) for which "
@@ -722,6 +722,13 @@ struct PerfStats {
   uint32_t async_pipelines = 0;
   uint32_t async_skipped_draws = 0;
   uint32_t async_shaders = 0;
+  uint32_t archive_hits = 0;
+  uint32_t archive_misses = 0;
+  uint32_t archive_misses_no_fragment = 0;
+  // Guest-visible sync point waits by PM4 packet: INTERRUPT, REG_TO_MEM,
+  // MEM_WRITE, COND_WRITE, EVENT_WRITE_SHD, other.
+  uint32_t sync_waits[6] = {};
+  uint32_t sync_points = 0;
   uint64_t depth_only_tess = 0;
   uint64_t depth_only_plain = 0;
 };
@@ -769,14 +776,19 @@ void PerfOnSwap() {
         "draws/frame={} gpu_wait={:.1f}ms/s ({} waits) "
         "pipelines_slow={} ({:.1f}ms, max {:.1f}ms) shaders={} ({:.1f}ms) "
         "geom_skipped={} depth_only/frame={} (tess {}) "
-        "async_pipelines={} async_skipped_draws={} async_shaders={}",
+        "async_pipelines={} async_skipped_draws={} async_shaders={} "
+        "archive_hits={} archive_misses={} (no_fragment {}) "
+        "sync_points={} sync_waits(int/r2m/mw/cw/ews/other)={}/{}/{}/{}/{}/{}",
         p.swaps / secs, p.max_frame_ns / 1e6, p.frames_over_40ms,
         p.swaps ? p.draws / p.swaps : 0, p.wait_ns / 1e6 / secs, p.waits,
         p.pipelines_slow, p.pipelines_ns / 1e6, p.pipelines_max_ns / 1e6,
         p.shaders, p.shaders_ns / 1e6, p.geometry_skipped,
         p.swaps ? (p.depth_only_tess + p.depth_only_plain) / p.swaps : 0,
         p.swaps ? p.depth_only_tess / p.swaps : 0, p.async_pipelines,
-        p.async_skipped_draws, p.async_shaders);
+        p.async_skipped_draws, p.async_shaders, p.archive_hits,
+        p.archive_misses, p.archive_misses_no_fragment, p.sync_points,
+        p.sync_waits[0], p.sync_waits[1], p.sync_waits[2], p.sync_waits[3],
+        p.sync_waits[4], p.sync_waits[5]);
   }
   auto last_swap = p.last_swap;
   p = PerfStats();
@@ -5867,7 +5879,29 @@ static bool MetalTitleInList(uint32_t title_id, const std::string& list) {
   return false;
 }
 
-void MetalCommandProcessor::SyncGpuWritesForGuest() {
+bool MetalCommandProcessor::IsCurrentTitleInList(
+    const std::string& list) const {
+  return MetalTitleInList(current_title_id_.load(std::memory_order_relaxed),
+                          list);
+}
+
+static void PerfCountGuestSyncWait(const char* reason) {
+  static const char* const kNames[] = {"INTERRUPT", "REG_TO_MEM", "MEM_WRITE",
+                                       "COND_WRITE", "EVENT_WRITE_SHD"};
+  size_t index = 5;
+  if (reason) {
+    for (size_t i = 0; i < 5; ++i) {
+      if (std::strstr(reason, kNames[i])) {
+        index = i;
+        break;
+      }
+    }
+  }
+  ++g_perf.sync_waits[index];
+}
+
+void MetalCommandProcessor::SyncGpuWritesForGuest(const char* reason) {
+  ++g_perf.sync_points;
   {
     uint32_t title_id = current_title_id_.load(std::memory_order_relaxed);
     if (title_id != sync_all_titles_checked_id_) {
@@ -5889,6 +5923,7 @@ void MetalCommandProcessor::SyncGpuWritesForGuest() {
               submission_current_;
       gpu_writes_pending_for_guest_ = false;
       if (pending_work && EnsureCommandBuffer()) {
+        PerfCountGuestSyncWait(reason);
         CommitAndWaitCurrentCommandBuffer();
       }
       return;
@@ -5933,6 +5968,7 @@ void MetalCommandProcessor::SyncGpuWritesForGuest() {
   if (!EnsureCommandBuffer()) {
     return;
   }
+  PerfCountGuestSyncWait(reason);
   CommitAndWaitCurrentCommandBuffer();
   ++guest_gpu_syncs_;
   if (!(guest_gpu_syncs_ & 255)) {
@@ -7298,6 +7334,27 @@ MTL::RenderPipelineState* MetalCommandProcessor::GetOrCreatePipelineState(
     if (pipeline_binary_archive_ && !g_archive_save_in_progress.load()) {
       NS::Array* archives = NS::Array::array(pipeline_binary_archive_);
       desc->setBinaryArchives(archives);
+      // If the pipeline is already in the archive (from previous runs or the
+      // prewarm), creating it is a cheap lookup - skip re-adding it, which
+      // may cost as much as compiling it again.
+      NS::Error* hit_error = nullptr;
+      MTL::RenderPipelineState* archived_pipeline =
+          device_->newRenderPipelineState(
+              desc, MTL::PipelineOptionFailOnBinaryArchiveMiss, nullptr,
+              &hit_error);
+      if (archived_pipeline) {
+        ++g_perf.archive_hits;
+        desc->release();
+        pipeline_cache_[key] = archived_pipeline;
+        if (record_disk_entry) {
+          AppendPipelineDiskCacheEntry(disk_entry);
+        }
+        return archived_pipeline;
+      }
+      ++g_perf.archive_misses;
+      if (!desc->fragmentFunction()) {
+        ++g_perf.archive_misses_no_fragment;
+      }
       NS::Error* archive_error = nullptr;
       if (pipeline_binary_archive_->addRenderPipelineFunctions(desc,
                                                                &archive_error)) {
@@ -10572,7 +10629,7 @@ void MetalCommandProcessor::UpdateSystemConstantValues(
 }
 #endif  // METAL_SHADER_CONVERTER_AVAILABLE
 
-#define XE_PM4_GUEST_VISIBLE_SYNC() SyncGpuWritesForGuest()
+#define XE_PM4_GUEST_VISIBLE_SYNC() SyncGpuWritesForGuest(__func__)
 #define COMMAND_PROCESSOR MetalCommandProcessor
 #include "../pm4_command_processor_implement.h"
 #undef COMMAND_PROCESSOR
