@@ -881,8 +881,9 @@ void MacWindow::HandleKeyEvent(void* event, bool is_down) {
               (ch >= 0xF700 && ch <= 0xF8FF)) {
             continue;
           }
-          KeyEvent char_event(this, VirtualKey(ch), 1, false, shift_pressed,
+          KeyEvent char_event(this, virtual_key, 1, false, shift_pressed,
                               ctrl_pressed, alt_pressed, super_pressed);
+          char_event.set_unicode(ch);
           OnKeyChar(char_event, destruction_receiver);
           if (destruction_receiver.IsWindowDestroyedOrClosed()) {
             return;
