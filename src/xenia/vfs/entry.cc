@@ -42,7 +42,7 @@ void Entry::Dump(xe::StringBuffer* string_buffer, int indent) {
   }
   string_buffer->Append(name());
   string_buffer->Append('\n');
-  for (auto& child : children_) {
+  for (auto& child : children()) {
     child->Dump(string_buffer, indent + 2);
   }
 }
@@ -150,7 +150,8 @@ void Entry::Rename(const std::filesystem::path file_path) {
   absolute_path_ =
       xe::utf8::join_guest_paths(device_->mount_path(), guest_path);
   path_ = guest_path;
-  name_ = xe::path_to_utf8(file_path.filename());
+  // Use the guest path since POSIX does not treat backslashes as separators.
+  name_ = path_parts.empty() ? std::string() : std::string(path_parts.back());
 }
 
 }  // namespace vfs

@@ -10,7 +10,9 @@
 #ifndef XENIA_VFS_DEVICES_HOST_PATH_DEVICE_H_
 #define XENIA_VFS_DEVICES_HOST_PATH_DEVICE_H_
 
+#include <filesystem>
 #include <string>
+#include <vector>
 
 #include "xenia/vfs/device.h"
 
@@ -26,6 +28,10 @@ class HostPathDevice : public Device {
   ~HostPathDevice() override;
 
   bool Initialize() override;
+  // Add a directory to this device using an independently configured host
+  // folder. Entries below it still belong to this device, not a nested device.
+  bool AddDirectory(const std::string_view name,
+                    const std::filesystem::path& host_path);
   void Dump(StringBuffer* string_buffer) override;
   Entry* ResolvePath(const std::string_view path) override;
 
@@ -45,8 +51,6 @@ class HostPathDevice : public Device {
   std::filesystem::path host_path() const { return host_path_; }
 
  private:
-  void PopulateEntry(HostPathEntry* parent_entry);
-
   std::string name_;
   std::filesystem::path host_path_;
   std::unique_ptr<Entry> root_entry_;

@@ -42,7 +42,6 @@ bool HostPathDevice::Initialize() {
   auto root_entry = new HostPathEntry(this, nullptr, "", host_path_);
   root_entry->attributes_ = kFileAttributeDirectory;
   root_entry_ = std::unique_ptr<Entry>(root_entry);
-  PopulateEntry(root_entry);
 
   return true;
 }
@@ -60,18 +59,28 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
   return root_entry_->ResolvePath(path);
 }
 
-void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry) {
-  auto child_infos = xe::filesystem::ListFiles(parent_entry->host_path());
-  for (auto& child_info : child_infos) {
-    auto child = HostPathEntry::Create(
-        this, parent_entry, parent_entry->host_path() / child_info.name,
-        child_info);
-    parent_entry->children_.push_back(std::unique_ptr<Entry>(child));
-
-    if (child_info.type == xe::filesystem::FileInfo::Type::kDirectory) {
-      PopulateEntry(child);
-    }
+bool HostPathDevice::AddDirectory(const std::string_view name,
+                                  const std::filesystem::path& host_path) {
+  auto global_lock = global_critical_region_.Acquire();
+  if (!root_entry_ || read_only_ || name.empty() || name == "." ||
+      name == ".." || name.find_first_of("/\\") != name.npos ||
+      root_entry_->Entry::GetChild(name)) {
+    return false;
   }
+  std::error_code ec;
+  std::filesystem::create_directories(host_path, ec);
+  if (ec) {
+    return false;
+  }
+  auto info = xe::filesystem::GetInfo(host_path);
+  if (!info || info->type != xe::filesystem::FileInfo::Type::kDirectory) {
+    return false;
+  }
+  info->name = xe::to_path(name);
+  auto root = static_cast<HostPathEntry*>(root_entry_.get());
+  root->children_.emplace_back(
+      HostPathEntry::Create(this, root, host_path, *info));
+  return true;
 }
 
 }  // namespace vfs
